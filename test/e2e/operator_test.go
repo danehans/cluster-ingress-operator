@@ -1093,7 +1093,11 @@ func TestIngressControllerCustomEndpoints(t *testing.T) {
 			Name: "tagging",
 			URL:  "https://tagging.us-east-1.amazonaws.com",
 		}
-		endpoints := []configv1.AWSServiceEndpoint{route53Endpoint, taggingEndpoint}
+		elbEndpoint := configv1.AWSServiceEndpoint{
+			Name: "elasticloadbalancing",
+			URL:  "https://elasticloadbalancing.us-east-1.amazonaws.com",
+		}
+		endpoints := []configv1.AWSServiceEndpoint{route53Endpoint, taggingEndpoint, elbEndpoint}
 		infraConfig.Spec.PlatformSpec.AWS.ServiceEndpoints = endpoints
 		if err := kclient.Update(context.TODO(), &infraConfig); err != nil {
 			t.Logf("failed to update infrastructure config: %v\n", err)
@@ -1149,7 +1153,7 @@ func TestIngressControllerCustomEndpoints(t *testing.T) {
 	}
 	defer assertIngressControllerDeleted(t, kclient, ic)
 	// Ensure the ingress controller is reporting expected status conditions.
-	if err := waitForIngressControllerCondition(kclient, 5*time.Minute, name, defaultAvailableConditions...); err != nil {
+	if err := waitForIngressControllerCondition(kclient, 1*time.Minute, name, defaultAvailableConditions...); err != nil {
 		t.Errorf("failed to observe expected conditions: %v", err)
 	}
 }

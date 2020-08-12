@@ -2,6 +2,7 @@ package aws
 
 import (
 	"fmt"
+	"net/url"
 	"reflect"
 	"strings"
 	"sync"
@@ -28,12 +29,38 @@ import (
 )
 
 const (
+	// httpsProtocol is the name of the https protocol.
+	httpsProtocol = "https"
 	// Route53Service is the name of the Route 53 service.
 	Route53Service = route53.ServiceName
 	// ELBService is the name of the Elastic Load Balancing service.
 	ELBService = elb.ServiceName
-	// ResourceGroupsService is the name of the Resource Group service.
-	ResourceGroupsService = resourcegroupstaggingapi.ServiceName
+	// TaggingService is the name of the Resource Group Tagging service.
+	TaggingService = resourcegroupstaggingapi.ServiceName
+	// AWSBaseDomain is the base domain for all AWS regions other than China.
+	AWSBaseDomain = "amazonaws.com"
+	// AWSChinaBaseDomain is the base domain name for the AWS China regions.
+	AWSChinaBaseDomain = "amazonaws.com.cn"
+	// route53NonRegionalizedEndpoint is the non-regionalized Route 53
+	// service endpoint for all regions other than "cn-north-1" and "cn-northwest-1".
+	// See https://docs.aws.amazon.com/general/latest/gr/r53.html foe details.
+	route53NonRegionalizedEndpoint = httpsProtocol + "://" + Route53Service + "." + AWSBaseDomain
+	// route53UsEastEndpoint is the only supported regionalized (us-east-1) Route 53
+	// service endpoint for all regions other than "cn-north-1" and "cn-northwest-1".
+	// See https://docs.aws.amazon.com/general/latest/gr/r53.html for details.
+	route53UsEastEndpoint = httpsProtocol + "://" + Route53Service + "." + endpoints.UsEast1RegionID + "." + AWSBaseDomain
+	// route53ChinaEndpoint is the Route 53 service endpoint used for the
+	// "cn-north-1" and "cn-northwest-1" China regions.
+	// See https://docs.aws.amazon.com/general/latest/gr/r53.html for details.
+	route53ChinaEndpoint = httpsProtocol + "://" + Route53Service + "." + AWSChinaBaseDomain
+	// taggingNonRegionalizedEndpoint is the Resource Group Tagging service endpoint
+	// without the region specified.
+	// See https://docs.aws.amazon.com/general/latest/gr/arg.html for details.
+	taggingNonRegionalizedEndpoint = httpsProtocol + "://" + TaggingService + "." + AWSBaseDomain
+	// taggingUsEastEndpoint is the Resource Group Tagging service endpoint for
+	// the us-east-1 region.
+	// See https://docs.aws.amazon.com/general/latest/gr/arg.html for details.
+	taggingUsEastEndpoint = httpsProtocol + "://" + TaggingService + "." + endpoints.UsEast1RegionID + "." + AWSBaseDomain
 )
 
 var (
@@ -109,74 +136,143 @@ func NewProvider(config Config, operatorReleaseVersion string) (*Provider, error
 		Fn:   request.MakeAddToUserAgentHandler("openshift.io ingress-operator", operatorReleaseVersion),
 	})
 
-	region := aws.StringValue(sess.Config.Region)
-	if len(region) > 0 {
-		log.Info("using region from shared config", "region name", region)
+	region, err := setRegion(&config, sess)
+	if err != nil {
+		return nil, err
+	}
+
+	elbCfg, err := config.getAwsConfig(region, ELBService)
+	if err != nil {
+		return nil, err
+	}
+	r53Cfg, err := config.getAwsConfig(region, Route53Service)
+	if err != nil {
+		return nil, err
+	}
+	tagCfg, err := config.getAwsConfig(region, TaggingService)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Provider{
+		elb:       elb.New(sess, elbCfg),
+		elbv2:     elbv2.New(sess, elbCfg),
+		route53:   route53.New(sess, r53Cfg),
+		tags:      resourcegroupstaggingapi.New(sess, tagCfg),
+		config:    config,
+		idsToTags: map[string]map[string]string{},
+		lbZones:   map[string]string{},
+	}, nil
+}
+
+// setRegion sets the region from sess, if it exists, or from cfg.
+// An error is returned if neither contain a region.
+func setRegion(cfg *Config, sess *session.Session) (string, error) {
+	r := aws.StringValue(sess.Config.Region)
+	if len(r) > 0 {
+		log.Info("using region from shared config", "region name", r)
 	} else {
-		region = config.Region
-		log.Info("using region from operator config", "region name", region)
+		r = cfg.Region
+		log.Info("using region from operator config", "region name", r)
 	}
-	if len(region) == 0 {
-		return nil, fmt.Errorf("region is required")
+	if len(r) == 0 {
+		return "", fmt.Errorf("region is required")
 	}
+	return r, nil
+}
 
-	r53Config := aws.NewConfig()
-	elbConfig := aws.NewConfig().WithRegion(region)
-	tagConfig := aws.NewConfig()
-
-	// If the region is in aws china, cn-north-1 or cn-northwest-1, we should:
-	// 1. hard code route53 api endpoint to https://route53.amazonaws.com.cn and region to "cn-northwest-1" as route53 is not GA in AWS China,
-	//    and aws sdk didn't have the endpoint.
-	// 2. use the aws china region cn-northwest-1 to setup tagging api correctly instead of "us-east-1"
+// getAwsConfig returns an AWS config based on the provided manager cfg and AWS
+// service. The returned config is based upon AWS Service documentation.
+// Route 53: https://docs.aws.amazon.com/general/latest/gr/r53.html
+// Tagging: https://docs.aws.amazon.com/general/latest/gr/arg.html
+// ELB: https://docs.aws.amazon.com/general/latest/gr/elb.html
+func (c *Config) getAwsConfig(region, service string) (*aws.Config, error) {
+	awsCfg := aws.NewConfig()
 	switch region {
 	case endpoints.CnNorth1RegionID, endpoints.CnNorthwest1RegionID:
-		tagConfig = tagConfig.WithRegion(endpoints.CnNorthwest1RegionID)
-		r53Config = r53Config.WithRegion(endpoints.CnNorthwest1RegionID)
-		r53Config = r53Config.WithEndpoint("https://route53.amazonaws.com.cn")
+		if service == TaggingService {
+			awsCfg = awsCfg.WithRegion(endpoints.CnNorthwest1RegionID)
+		}
+		if service == Route53Service {
+			awsCfg = awsCfg.WithRegion(endpoints.CnNorthwest1RegionID)
+			awsCfg = awsCfg.WithEndpoint(route53ChinaEndpoint)
+		}
 	default:
-		// Since Route 53 is not a regionalized service, the Tagging API will
-		// only return hosted zone resources when the region is "us-east-1".
-		tagConfig = tagConfig.WithRegion(endpoints.UsEast1RegionID)
-		// Route 53 in AWS Regions other than the AWS Beijing and
-		// Ningxia (China) Regions: specify us-east-1 as the Region.
-		// See https://docs.aws.amazon.com/general/latest/gr/r53.html for details.
-		r53Config = r53Config.WithRegion(endpoints.UsEast1RegionID)
-		if len(config.ServiceEndpoints) > 0 {
+		if len(c.ServiceEndpoints) > 0 {
 			route53Found := false
 			elbFound := false
 			tagFound := false
-			for _, ep := range config.ServiceEndpoints {
+			for _, ep := range c.ServiceEndpoints {
 				switch {
 				case route53Found && elbFound && tagFound:
 					break
 				case ep.Name == Route53Service:
 					route53Found = true
-					r53Config = r53Config.WithEndpoint(ep.URL)
+					if err := ValidateServiceEndpoint(ep.URL); err != nil {
+						return nil, fmt.Errorf("failed to validate service endpoint %s: %v", Route53Service, err)
+					}
+					awsCfg = awsCfg.WithEndpoint(ep.URL)
 					log.Info("using route53 custom endpoint", "url", ep.URL)
 				case ep.Name == ELBService:
 					elbFound = true
-					elbConfig = elbConfig.WithEndpoint(ep.URL)
+					if err := ValidateServiceEndpoint(ep.URL); err != nil {
+						return nil, fmt.Errorf("failed to validate service endpoint %s: %v", ELBService, err)
+					}
+					awsCfg = awsCfg.WithEndpoint(ep.URL)
 					log.Info("using elb custom endpoint", "url", ep.URL)
-				case ep.Name == ResourceGroupsService:
+				case ep.Name == TaggingService:
 					tagFound = true
-					tagConfig = tagConfig.WithEndpoint(ep.URL)
+					if err := ValidateServiceEndpoint(ep.URL); err != nil {
+						return nil, fmt.Errorf("failed to validate service endpoint %s: %v", TaggingService, err)
+					}
+					awsCfg = awsCfg.WithEndpoint(ep.URL)
 					log.Info("using group tagging custom endpoint", "url", ep.URL)
 				}
 			}
+			if !route53Found && !elbFound && !tagFound {
+				return nil, fmt.Errorf("%s, %s and %s services must be configured when using custom endpoints",
+					ELBService, Route53Service, TaggingService)
+			}
+		} else {
+			switch service {
+			case TaggingService:
+				// Tagging API must use us-east-1 region to return the hosted zone ID
+				// of Route 53 elb.
+				awsCfg = awsCfg.WithRegion(endpoints.UsEast1RegionID)
+			case Route53Service:
+				awsCfg = awsCfg.WithRegion(endpoints.UsEast1RegionID)
+			default:
+				// Use the provided region for all other services.
+				awsCfg = awsCfg.WithRegion(region)
+			}
 		}
 	}
+	return awsCfg, nil
+}
 
-	return &Provider{
-		elb: elb.New(sess, elbConfig),
-		// TODO: Add custom endpoint support for elbv2. See the following for details:
-		// https://docs.aws.amazon.com/general/latest/gr/elb.html
-		elbv2:     elbv2.New(sess, aws.NewConfig().WithRegion(region)),
-		route53:   route53.New(sess, r53Config),
-		tags:      resourcegroupstaggingapi.New(sess, tagConfig),
-		config:    config,
-		idsToTags: map[string]map[string]string{},
-		lbZones:   map[string]string{},
-	}, nil
+// ValidateServiceEndpoint validates uri as a valid URL and that it contains either
+// region "us-east-1" or no region for the tagging and Route 53 service endpoints.
+// Since Route 53 is not a regionalized service, the Tagging API will only return
+// hosted zone resources when the region is "us-east-1".
+// See https://docs.aws.amazon.com/general/latest/gr/r53.html for details.
+func ValidateServiceEndpoint(uri string) error {
+	u, err := url.ParseRequestURI(uri)
+	if err != nil {
+		return err
+	}
+	if strings.Contains(u.Host, Route53Service) {
+		if uri != route53NonRegionalizedEndpoint && uri != route53UsEastEndpoint {
+			return fmt.Errorf("invalid endpoint url %s for service %s; only %s and %s are supported", uri,
+				Route53Service, route53NonRegionalizedEndpoint, route53UsEastEndpoint)
+		}
+	}
+	if strings.Contains(u.Host, TaggingService) {
+		if uri != taggingNonRegionalizedEndpoint && uri != taggingUsEastEndpoint {
+			return fmt.Errorf("invalid endpoint url %s for service %s; only %s and %s are supported", uri,
+				TaggingService, taggingNonRegionalizedEndpoint, taggingUsEastEndpoint)
+		}
+	}
+	return nil
 }
 
 // getZoneID finds the ID of given zoneConfig in Route53. If an ID is already

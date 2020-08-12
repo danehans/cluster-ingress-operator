@@ -453,32 +453,20 @@ func (r *reconciler) createDNSProvider(dnsConfig *configv1.DNS, platformStatus *
 					break
 				case ep.Name == awsdns.Route53Service:
 					route53Found = true
-					scheme, err := operatorutil.URI(ep.URL)
-					if err != nil {
-						return nil, fmt.Errorf("failed to validate URI %s: %v", ep.URL, err)
-					}
-					if scheme != operatorutil.SchemeHTTPS {
-						return nil, fmt.Errorf("invalid scheme for URI %s; must be %s", ep.URL, operatorutil.SchemeHTTPS)
+					if err := operatorutil.ValidateURI(ep.URL, true); err != nil {
+						return nil, fmt.Errorf("failed to validate ValidateURI %s: %v", ep.URL, err)
 					}
 					cfg.ServiceEndpoints = append(cfg.ServiceEndpoints, awsdns.ServiceEndpoint{Name: ep.Name, URL: ep.URL})
 				case ep.Name == awsdns.ELBService:
 					elbFound = true
-					scheme, err := operatorutil.URI(ep.URL)
-					if err != nil {
-						return nil, fmt.Errorf("failed to validate URI %s: %v", ep.URL, err)
-					}
-					if scheme != operatorutil.SchemeHTTPS {
-						return nil, fmt.Errorf("invalid scheme for URI %s; must be %s", ep.URL, operatorutil.SchemeHTTPS)
+					if err := operatorutil.ValidateURI(ep.URL, true); err != nil {
+						return nil, fmt.Errorf("failed to validate url %s: %v", ep.URL, err)
 					}
 					cfg.ServiceEndpoints = append(cfg.ServiceEndpoints, awsdns.ServiceEndpoint{Name: ep.Name, URL: ep.URL})
-				case ep.Name == awsdns.ResourceGroupsService:
+				case ep.Name == awsdns.TaggingService:
 					tagFound = true
-					scheme, err := operatorutil.URI(ep.URL)
-					if err != nil {
-						return nil, fmt.Errorf("failed to validate URI %s: %v", ep.URL, err)
-					}
-					if scheme != operatorutil.SchemeHTTPS {
-						return nil, fmt.Errorf("invalid scheme for URI %s; must be %s", ep.URL, operatorutil.SchemeHTTPS)
+					if err := operatorutil.ValidateURI(ep.URL, true); err != nil {
+						return nil, fmt.Errorf("failed to validate url %s: %v", ep.URL, err)
 					}
 					cfg.ServiceEndpoints = append(cfg.ServiceEndpoints, awsdns.ServiceEndpoint{Name: ep.Name, URL: ep.URL})
 				}
